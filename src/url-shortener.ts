@@ -1,31 +1,14 @@
 import * as path from 'path';
-import { Construct, Stack, CfnOutput } from '@aws-cdk/core';
-import { AttributeType, Table, TableProps } from '@aws-cdk/aws-dynamodb';
-import { Code, Function, IFunction, Runtime } from '@aws-cdk/aws-lambda';
-import {
-  RestApi,
-  JsonSchemaVersion,
-  JsonSchemaType,
-  LambdaIntegration,
-  MockIntegration,
-  MethodOptions,
-  AwsIntegration,
-  PassthroughBehavior,
-  IResource,
-  DomainName,
-} from '@aws-cdk/aws-apigateway';
-import {
-  DnsValidatedCertificate,
-  ICertificate,
-} from '@aws-cdk/aws-certificatemanager';
-import { IHostedZone, ARecord, RecordTarget } from '@aws-cdk/aws-route53';
-import { ApiGatewayDomain } from '@aws-cdk/aws-route53-targets';
-import {
-  Role,
-  ServicePrincipal,
-  PolicyDocument,
-  PolicyStatement,
-} from '@aws-cdk/aws-iam';
+import { Construct } from 'constructs';
+import { Stack, CfnOutput, 
+         aws_dynamodb as Dynamodb,
+         aws_apigateway as ApiGateway,
+         aws_lambda as Lambda,
+         aws_certificatemanager as CertificateManager,
+         aws_iam as Iam,
+         aws_route53 as Route53,
+         aws_route53_targets as Route53Targets } from 'aws-cdk-lib';
+import { NodejsFunction } from 'aws-cdk-lib/aws-lambda-nodejs';         
 
 import { hash, getKeySchemaProperty } from './utils';
 
@@ -40,8 +23,8 @@ interface ResourceConfiguration {
 
 interface ResourceMethod {
   method: string;
-  integration: LambdaIntegration | MockIntegration;
-  methodOptions: MethodOptions;
+  integration: ApiGateway.LambdaIntegration | ApiGateway.MockIntegration;
+  methodOptions: ApiGateway.MethodOptions;
 }
 
 /**
@@ -62,7 +45,7 @@ export interface URLShortenerProps {
    *
    * @default - A new DynamoDB Table is created.
    */
-  readonly dynamoTable?: Table;
+  readonly dynamoTable?: Dynamodb.Table;
 }
 
 /**
@@ -79,7 +62,7 @@ export interface CustomDomainOptions {
    * Hosted zone of the domain which will be used to create alias record(s)
    * from domain name in the hosted zone to URL shortener API endpoint.
    */
-  readonly zone: IHostedZone;
+  readonly zone: Route53.IHostedZone;
 
   /**
    * The AWS Certificate Manager (ACM) certificate that will be associated with
@@ -87,7 +70,7 @@ export interface CustomDomainOptions {
    *
    * @default - A new DNS validated certificate is created in the same region.
    */
-  readonly certificate?: ICertificate;
+  readonly certificate?: CertificateManager.ICertificate;
 }
 
 /**
@@ -103,10 +86,10 @@ export interface CustomDomainOptions {
  */
 export class URLShortener extends Construct {
   private readonly _stack: Stack;
-  private readonly _apigw: RestApi;
-  private readonly _dynamoTable: Table;
+  private readonly _apigw: ApiGateway.RestApi;
+  private readonly _dynamoTable: Dynamodb.Table;
   private readonly _dynamoTableKeyName: string;
-  private readonly _shortenFn: IFunction;
+  private readonly _shortenFn: Lambda.IFunction;
 
   /**
    * Default table props with partition key set to `id`, you can use it to extend
@@ -118,10 +101,10 @@ export class URLShortener extends Construct {
    *   stream: StreamViewType.NEW_AND_OLD_IMAGES,
    * });
    */
-  public static readonly defaultDynamoTableProps: TableProps = {
+  public static readonly defaultDynamoTableProps: Dynamodb.TableProps = {
     partitionKey: {
       name: 'id',
-      type: AttributeType.STRING,
+      type: Dynamodb.AttributeType.STRING,
     },
   };
 
@@ -129,7 +112,7 @@ export class URLShortener extends Construct {
     super(scope, id);
 
     this._stack = Stack.of(this);
-    this._apigw = new RestApi(this, 'Api', {
+    this._apigw = new ApiGateway.RestApi(this, 'Api', {
       restApiName: `${id}-URLShortener-Api`,
     });
     this._dynamoTable = props?.dynamoTable || this._makeTable();
@@ -149,12 +132,12 @@ export class URLShortener extends Construct {
             methods: [
               {
                 method: 'GET',
-                integration: new AwsIntegration({
+                integration: new ApiGateway.AwsIntegration({
                   service: 'dynamodb',
                   action: 'UpdateItem',
                   options: {
                     credentialsRole: apigwDynamodbRole,
-                    passthroughBehavior: PassthroughBehavior.WHEN_NO_TEMPLATES,
+                    passthroughBehavior: ApiGateway.PassthroughBehavior.WHEN_NO_TEMPLATES,
                     integrationResponses: [
                       {
                         selectionPattern: '200',
@@ -233,8 +216,8 @@ export class URLShortener extends Construct {
         methods: [
           {
             method: 'GET',
-            integration: new MockIntegration({
-              passthroughBehavior: PassthroughBehavior.WHEN_NO_TEMPLATES,
+            integration: new ApiGateway.MockIntegration({
+              passthroughBehavior: ApiGateway.PassthroughBehavior.WHEN_NO_TEMPLATES,
               integrationResponses: [
                 {
                   statusCode: '404',
@@ -266,7 +249,7 @@ export class URLShortener extends Construct {
           },
           {
             method: 'POST',
-            integration: new LambdaIntegration(this._shortenFn),
+            integration: new ApiGateway.LambdaIntegration(this._shortenFn),
             methodOptions: {
               requestParameters: {
                 'method.request.header.Content-Type': true,
@@ -287,7 +270,7 @@ export class URLShortener extends Construct {
   }
 
   private _buildApiGateway(
-    parentResource: IResource,
+    parentResource: ApiGateway.IResource,
     resourceConfiguration: ResourceConfiguration,
   ) {
     const { childResources = {}, methods = [] } = resourceConfiguration;
@@ -304,34 +287,35 @@ export class URLShortener extends Construct {
     );
   }
 
-  private _makeTable(): Table {
-    return new Table(this, 'Table', URLShortener.defaultDynamoTableProps);
+  private _makeTable(): Dynamodb.Table {
+    return new Dynamodb.Table(this, 'Table', URLShortener.defaultDynamoTableProps);
   }
 
   private _makeShortenLambdaFn() {
-    const fn = new Function(this, 'Function', {
-      runtime: Runtime.NODEJS_12_X,
-      code: Code.fromAsset(path.join(__dirname, 'lambda-fns', 'shorten')),
-      handler: 'index.handler',
+    const fn = new NodejsFunction(this, 'Function', {
+      runtime: Lambda.Runtime.NODEJS_12_X,
+      handler: 'handler',
+      entry: path.join(__dirname, 'lambda-fns/shorten/index.ts'),
+      memorySize: 1024,
       environment: {
         TABLE_NAME: this._dynamoTable.tableName,
         KEY_NAME: this._dynamoTableKeyName,
       },
-    });
+    });    
 
     this._dynamoTable.grantWriteData(fn);
     return fn;
   }
 
-  private _makeValidationModel(api: RestApi) {
+  private _makeValidationModel(api: ApiGateway.RestApi) {
     return api.addModel('ValidationModel', {
       modelName: 'ValidationModel',
       schema: {
-        schema: JsonSchemaVersion.DRAFT4,
-        type: JsonSchemaType.OBJECT,
+        schema: ApiGateway.JsonSchemaVersion.DRAFT4,
+        type: ApiGateway.JsonSchemaType.OBJECT,
         properties: {
           url: {
-            type: JsonSchemaType.STRING,
+            type: ApiGateway.JsonSchemaType.STRING,
             format: 'uri',
             pattern: '^https?://',
           },
@@ -343,12 +327,12 @@ export class URLShortener extends Construct {
   }
 
   private _makeRole(tableArn: string) {
-    return new Role(this, 'Role', {
-      assumedBy: new ServicePrincipal('apigateway.amazonaws.com'),
+    return new Iam.Role(this, 'Role', {
+      assumedBy: new Iam.ServicePrincipal('apigateway.amazonaws.com'),
       inlinePolicies: {
-        APIGatewayDynamoDBUpdateItem: new PolicyDocument({
+        APIGatewayDynamoDBUpdateItem: new Iam.PolicyDocument({
           statements: [
-            new PolicyStatement({
+            new Iam.PolicyStatement({
               actions: ['dynamodb:UpdateItem'],
               resources: [tableArn],
             }),
@@ -358,7 +342,7 @@ export class URLShortener extends Construct {
     });
   }
 
-  private _makeUsagePlan(api: RestApi) {
+  private _makeUsagePlan(api: ApiGateway.RestApi) {
     const apiKey = api.addApiKey('ApiKey', {
       apiKeyName: `${this._stack.stackName}-URLShortener-ApiKey`,
     });
@@ -367,26 +351,30 @@ export class URLShortener extends Construct {
       value: `https://console.aws.amazon.com/apigateway/home?region=${this._stack.region}#/api-keys/${apiKey.keyId}`,
     });
 
-    return api
+    const plan = api
       .addUsagePlan('UsagePlan', {
         name: `${this._stack.stackName}-URLShortener-UsagePlan`,
-        apiKey,
         description: `Usage plan for ${this._stack.stackName} url shortener api`,
-      })
-      .addApiStage({
+      });
+
+    plan.addApiStage({
         stage: api.deploymentStage,
       });
+
+    plan.addApiKey(apiKey);
+
+    return plan;
   }
 
   addDomainName(options: CustomDomainOptions): this {
     const { zone, domainName, certificate } = options;
     const domainNameHash = hash(domainName);
 
-    const domain = new DomainName(this, `DomainName${domainNameHash}`, {
+    const domain = new ApiGateway.DomainName(this, `DomainName${domainNameHash}`, {
       domainName,
       certificate:
         certificate ||
-        new DnsValidatedCertificate(
+        new CertificateManager.DnsValidatedCertificate(
           this,
           `DnsValidatedCertificate${domainNameHash}`,
           {
@@ -397,10 +385,10 @@ export class URLShortener extends Construct {
     });
     domain.addBasePathMapping(this._apigw);
 
-    const aliasRecord = new ARecord(this, `AliasRecord${domainNameHash}`, {
+    const aliasRecord = new Route53.ARecord(this, `AliasRecord${domainNameHash}`, {
       zone,
       recordName: domainName,
-      target: RecordTarget.fromAlias(new ApiGatewayDomain(domain)),
+      target: Route53.RecordTarget.fromAlias(new Route53Targets.ApiGatewayDomain(domain)),
     });
 
     new CfnOutput(this, `CustomDomainApiEndpoint${domainNameHash}`, {
